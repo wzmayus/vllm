@@ -296,15 +296,22 @@ class cmake_build_ext(build_ext):
             # copy vllm/third_party/triton_kernels/**/*.py from self.build_lib
             # to current directory so that they can be included in the editable
             # build
-            print(
-                f"Copying {self.build_lib}/vllm/third_party/triton_kernels "
-                "to vllm/third_party/triton_kernels"
-            )
-            shutil.copytree(
-                f"{self.build_lib}/vllm/third_party/triton_kernels",
-                "vllm/third_party/triton_kernels",
-                dirs_exist_ok=True,
-            )
+            src_dir = f"{self.build_lib}/vllm/third_party/triton_kernels"
+            if os.getenv("VLLM_BUILD_ONLY") and not os.path.exists(src_dir):
+                print(
+                    f"Skipping copy of {src_dir} "
+                    "to vllm/third_party/triton_kernels (VLLM_BUILD_ONLY set)"
+                )
+            else:
+                print(
+                    f"Copying {src_dir} "
+                    "to vllm/third_party/triton_kernels"
+                )
+                shutil.copytree(
+                    src_dir,
+                    "vllm/third_party/triton_kernels",
+                    dirs_exist_ok=True,
+                )
 
 
 class precompiled_build_ext(build_ext):
@@ -764,6 +771,12 @@ if envs.VLLM_USE_PRECOMPILED:
     )
     for pkg, files in patch.items():
         package_data.setdefault(pkg, []).extend(files)
+
+# Filter extensions if VLLM_BUILD_ONLY is set
+if os.getenv("VLLM_BUILD_ONLY"):
+    build_only = os.getenv("VLLM_BUILD_ONLY")
+    ext_modules = [ext for ext in ext_modules if build_only in ext.name]
+    print(f"VLLM_BUILD_ONLY={build_only}: restricting build to {[ext.name for ext in ext_modules]}")
 
 if _no_device():
     ext_modules = []

@@ -73,6 +73,18 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
+def _activate_worker(worker):
+    import torch
+    from vllm.device_allocator.vmm_allocator import VMMAllocator
+
+    VMMAllocator.get_instance().disable_aliasing()
+    VMMAllocator.get_instance().activate_memory(torch.cuda.current_device())
+
+    # Restore KV cache if it was deferred/minimized (for Aliased Init)
+    if hasattr(worker, "restore_full_kv_cache"):
+        worker.restore_full_kv_cache()
+
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -491,6 +503,27 @@ class EngineCore:
 
     def wake_up(self, tags: list[str] | None = None):
         self.model_executor.wake_up(tags)
+
+    def activate_model(self):
+        """
+        Activates the model from aliased (host-backed) state to real GPU state.
+        This is used when --enable-aliased-init is set.
+        """
+        if self.vllm_config.model_config.enable_aliased_init:
+            logger.info("Activating model memory from Host Backing...")
+
+            # Activate locally (if single process)
+            try:
+                import torch
+                from vllm.device_allocator.vmm_allocator import VMMAllocator
+
+                VMMAllocator.get_instance().disable_aliasing()
+                VMMAllocator.get_instance().activate_memory(torch.cuda.current_device())
+            except Exception:
+                pass  # Might fail if no CUDA context or VMM not used locally
+
+            # Activate on workers
+            self.collective_rpc(_activate_worker)
 
     def is_sleeping(self) -> bool:
         return self.model_executor.is_sleeping

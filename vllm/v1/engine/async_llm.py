@@ -765,6 +765,9 @@ class AsyncLLM(EngineClient):
         if self.logger_manager is not None:
             self.logger_manager.record_sleep_state(0, 0)
 
+    async def activate_model(self) -> None:
+        await self.engine_core.activate_model_async()
+
     async def is_sleeping(self) -> bool:
         return await self.engine_core.is_sleeping_async()
 

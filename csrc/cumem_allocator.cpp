@@ -2,6 +2,10 @@
 // Important: allocation size, CUdeviceptr and CUmemGenericAllocationHandle*
 // need to be unsigned long long
 #include <iostream>
+#include <vector>
+
+#include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
 
 #include "cumem_allocator_compat.h"
 
@@ -79,6 +83,44 @@ CUresult error_code = no_error;  // store error code
 static PyObject* g_python_malloc_callback = nullptr;
 static PyObject* g_python_free_callback = nullptr;
 
+// Aliasing support
+static bool g_use_aliasing = false;
+static bool g_use_host_mode = false;
+static size_t g_sparse_limit = 0;
+static CUmemGenericAllocationHandle g_aliased_handle = 0;
+static size_t g_aliased_handle_size = 0;
+
+static PyObject* python_set_aliasing_param(PyObject* self, PyObject* args) {
+  int enabled;
+  unsigned long long handle;
+  unsigned long long size;
+  if (!PyArg_ParseTuple(args, "pKK", &enabled, &handle, &size)) {
+    return nullptr;
+  }
+  g_use_aliasing = (bool)enabled;
+  g_aliased_handle = (CUmemGenericAllocationHandle)handle;
+  g_aliased_handle_size = (size_t)size;
+  Py_RETURN_NONE;
+}
+
+static PyObject* python_set_host_mode(PyObject* self, PyObject* args) {
+  int enabled;
+  if (!PyArg_ParseTuple(args, "p", &enabled)) {
+    return nullptr;
+  }
+  g_use_host_mode = (bool)enabled;
+  Py_RETURN_NONE;
+}
+
+static PyObject* python_set_sparse_limit(PyObject* self, PyObject* args) {
+  unsigned long long limit;
+  if (!PyArg_ParseTuple(args, "K", &limit)) {
+    return nullptr;
+  }
+  g_sparse_limit = (size_t)limit;
+  Py_RETURN_NONE;
+}
+
 // ---------------------------------------------------------------------------
 // Helper functions:
 
@@ -90,6 +132,53 @@ void ensure_context(unsigned long long device) {
     CUDA_CHECK(cuDevicePrimaryCtxRetain(&pctx, device));
     CUDA_CHECK(cuCtxSetCurrent(pctx));
   }
+}
+
+void create_and_map_aliased(unsigned long long device, ssize_t size, CUdeviceptr d_mem,
+                            CUmemGenericAllocationHandle* p_memHandle) {
+  ensure_context(device);
+  *p_memHandle = g_aliased_handle;
+  size_t granularity = g_aliased_handle_size;
+  if (granularity == 0) granularity = 2 * 1024 * 1024; // fallback
+
+  for (size_t offset = 0; offset < size; offset += granularity) {
+     // We do not check boundary strictly here because 'size' is already aligned to granularity in my_malloc
+     CUDA_CHECK(cuMemMap(d_mem + offset, granularity, 0, g_aliased_handle, 0));
+     if (error_code != 0) return;
+  }
+
+  CUmemAccessDesc accessDesc = {};
+  accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  accessDesc.location.id = device;
+  accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+
+  CUDA_CHECK(cuMemSetAccess(d_mem, size, &accessDesc, 1));
+}
+
+void create_and_map_host(unsigned long long device, ssize_t size, CUdeviceptr d_mem,
+                            CUmemGenericAllocationHandle* p_memHandle) {
+  ensure_context(device);
+  
+  CUmemAllocationProp prop = {};
+  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+#ifndef USE_ROCM
+  prop.location.type = CU_MEM_LOCATION_TYPE_HOST;
+#else
+  prop.location.type = hipMemLocationTypeHost;
+#endif
+  prop.location.id = 0;
+  prop.allocFlags.compressionType = CU_MEM_ALLOCATION_COMP_NONE;
+
+  CUDA_CHECK(cuMemCreate(p_memHandle, (size_t)size, &prop, 0));
+  
+  CUDA_CHECK(cuMemMap(d_mem, (size_t)size, 0, *p_memHandle, 0));
+
+  CUmemAccessDesc accessDesc = {};
+  accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  accessDesc.location.id = device;
+  accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+
+  CUDA_CHECK(cuMemSetAccess(d_mem, size, &accessDesc, 1));
 }
 
 void create_and_map(unsigned long long device, ssize_t size, CUdeviceptr d_mem,
@@ -179,9 +268,11 @@ void unmap_and_release(unsigned long long device, ssize_t size,
   if (error_code != 0) {
     return;
   }
-  CUDA_CHECK(cuMemRelease(*p_memHandle));
-  if (error_code != 0) {
-    return;
+  if (*p_memHandle != g_aliased_handle) {
+      CUDA_CHECK(cuMemRelease(*p_memHandle));
+      if (error_code != 0) {
+        return;
+      }
   }
 #else
   unsigned long long allocated_size = 0;
@@ -373,7 +464,17 @@ void* my_malloc(ssize_t size, int device, CUstream stream) {
 
   // do the final mapping
 #ifndef USE_ROCM
-  create_and_map(device, alignedSize, d_mem, p_memHandle);
+  if (g_use_host_mode) {
+    size_t map_size = alignedSize;
+    if (g_sparse_limit > 0) {
+        map_size = std::min((size_t)alignedSize, g_sparse_limit);
+    }
+    create_and_map_host(device, map_size, d_mem, p_memHandle);
+  } else if (g_use_aliasing) {
+    create_and_map_aliased(device, alignedSize, d_mem, p_memHandle);
+  } else {
+    create_and_map(device, alignedSize, d_mem, p_memHandle);
+  }
 #else
   create_and_map(device, alignedSize, d_mem, p_memHandle, chunk_sizes,
                  num_chunks);
@@ -632,6 +733,292 @@ static PyObject* python_unmap_and_release(PyObject* self, PyObject* args) {
   Py_RETURN_NONE;
 }
 
+static PyObject* python_reserve_address(PyObject* self, PyObject* args) {
+  unsigned long long size;
+  unsigned long long alignment = 0;
+  unsigned long long addr = 0;
+  unsigned long long flags = 0;
+  if (!PyArg_ParseTuple(args, "K|KKK", &size, &alignment, &addr, &flags)) {
+    return nullptr;
+  }
+  CUdeviceptr d_mem;
+#ifndef USE_ROCM
+  CUDA_CHECK(cuMemAddressReserve(&d_mem, (size_t)size, (size_t)alignment, (CUdeviceptr)addr, (unsigned long long)flags));
+#else
+  CUDA_CHECK(cuMemAddressReserve(&d_mem, (size_t)size, (size_t)alignment, (CUdeviceptr)addr, (unsigned long long)flags));
+#endif
+  if (error_code != 0) {
+     PyErr_Format(PyExc_RuntimeError, "cuMemAddressReserve failed: %d", error_code);
+     error_code = no_error;
+     return nullptr;
+  }
+  return PyLong_FromUnsignedLongLong((unsigned long long)d_mem);
+}
+
+static PyObject* python_create_physical(PyObject* self, PyObject* args) {
+  unsigned long long size;
+  int device_id;
+  if (!PyArg_ParseTuple(args, "Ki", &size, &device_id)) {
+    return nullptr;
+  }
+  ensure_context(device_id);
+  CUmemAllocationProp prop = {};
+  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  prop.location.id = device_id;
+  prop.allocFlags.compressionType = CU_MEM_ALLOCATION_COMP_NONE;
+
+  CUmemGenericAllocationHandle handle;
+  CUDA_CHECK(cuMemCreate(&handle, (size_t)size, &prop, 0));
+  if (error_code != 0) {
+     PyErr_Format(PyExc_RuntimeError, "cuMemCreate failed: %d", error_code);
+     error_code = no_error;
+     return nullptr;
+  }
+  return PyLong_FromUnsignedLongLong((unsigned long long)handle);
+}
+
+static PyObject* python_create_host_physical(PyObject* self, PyObject* args) {
+  unsigned long long size;
+  if (!PyArg_ParseTuple(args, "K", &size)) {
+    return nullptr;
+  }
+  
+  CUmemAllocationProp prop = {};
+  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+#ifndef USE_ROCM
+  prop.location.type = CU_MEM_LOCATION_TYPE_HOST;
+#else
+  prop.location.type = hipMemLocationTypeHost;
+#endif
+  prop.location.id = 0;
+  prop.allocFlags.compressionType = CU_MEM_ALLOCATION_COMP_NONE;
+
+  CUmemGenericAllocationHandle handle;
+  CUDA_CHECK(cuMemCreate(&handle, (size_t)size, &prop, 0));
+  if (error_code != 0) {
+     PyErr_Format(PyExc_RuntimeError, "cuMemCreate (Host) failed: %d", error_code);
+     error_code = no_error;
+     return nullptr;
+  }
+  return PyLong_FromUnsignedLongLong((unsigned long long)handle);
+}
+
+static PyObject* python_map_memory(PyObject* self, PyObject* args) {
+  unsigned long long d_mem;
+  unsigned long long size;
+  unsigned long long offset;
+  unsigned long long handle;
+  unsigned long long flags = 0;
+  if (!PyArg_ParseTuple(args, "KKKK|K", &d_mem, &size, &offset, &handle, &flags)) {
+    return nullptr;
+  }
+  CUDA_CHECK(cuMemMap((CUdeviceptr)d_mem, (size_t)size, (size_t)offset, (CUmemGenericAllocationHandle)handle, (unsigned long long)flags));
+  if (error_code != 0) {
+     PyErr_Format(PyExc_RuntimeError, "cuMemMap failed: %d", error_code);
+     error_code = no_error;
+     return nullptr;
+  }
+  Py_RETURN_NONE;
+}
+
+static PyObject* python_unmap_memory(PyObject* self, PyObject* args) {
+  unsigned long long d_mem;
+  unsigned long long size;
+  if (!PyArg_ParseTuple(args, "KK", &d_mem, &size)) {
+    return nullptr;
+  }
+  CUDA_CHECK(cuMemUnmap((CUdeviceptr)d_mem, (size_t)size));
+  if (error_code != 0) {
+     PyErr_Format(PyExc_RuntimeError, "cuMemUnmap failed: %d", error_code);
+     error_code = no_error;
+     return nullptr;
+  }
+  Py_RETURN_NONE;
+}
+
+static PyObject* python_set_access(PyObject* self, PyObject* args) {
+  unsigned long long d_mem;
+  unsigned long long size;
+  int device_id;
+  if (!PyArg_ParseTuple(args, "KKi", &d_mem, &size, &device_id)) {
+    return nullptr;
+  }
+  CUmemAccessDesc accessDesc = {};
+  accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  accessDesc.location.id = device_id;
+  accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  CUDA_CHECK(cuMemSetAccess((CUdeviceptr)d_mem, (size_t)size, &accessDesc, 1));
+  if (error_code != 0) {
+     PyErr_Format(PyExc_RuntimeError, "cuMemSetAccess failed: %d", error_code);
+     error_code = no_error;
+     return nullptr;
+  }
+  Py_RETURN_NONE;
+}
+
+static PyObject* python_release_physical(PyObject* self, PyObject* args) {
+  unsigned long long handle;
+  if (!PyArg_ParseTuple(args, "K", &handle)) {
+    return nullptr;
+  }
+  CUDA_CHECK(cuMemRelease((CUmemGenericAllocationHandle)handle));
+  if (error_code != 0) {
+     PyErr_Format(PyExc_RuntimeError, "cuMemRelease failed: %d", error_code);
+     error_code = no_error;
+     return nullptr;
+  }
+  Py_RETURN_NONE;
+}
+
+static PyObject* python_free_address(PyObject* self, PyObject* args) {
+  unsigned long long d_mem;
+  unsigned long long size;
+  if (!PyArg_ParseTuple(args, "KK", &d_mem, &size)) {
+    return nullptr;
+  }
+  CUDA_CHECK(cuMemAddressFree((CUdeviceptr)d_mem, (size_t)size));
+  if (error_code != 0) {
+     PyErr_Format(PyExc_RuntimeError, "cuMemAddressFree failed: %d", error_code);
+     error_code = no_error;
+     return nullptr;
+  }
+  Py_RETURN_NONE;
+}
+
+static PyObject* python_get_granularity(PyObject* self, PyObject* args) {
+  int device_id;
+  if (!PyArg_ParseTuple(args, "i", &device_id)) {
+    return nullptr;
+  }
+  CUmemAllocationProp prop = {};
+  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  prop.location.id = device_id;
+  prop.allocFlags.compressionType = CU_MEM_ALLOCATION_COMP_NONE;
+
+  size_t granularity;
+  CUDA_CHECK(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+  if (error_code != 0) {
+     PyErr_Format(PyExc_RuntimeError, "cuMemGetAllocationGranularity failed: %d", error_code);
+     error_code = no_error;
+     return nullptr;
+  }
+  return PyLong_FromSize_t(granularity);
+}
+
+static PyObject* python_update_handle(PyObject* self, PyObject* args) {
+  unsigned long long p_memHandle_addr;
+  unsigned long long new_handle_val;
+  if (!PyArg_ParseTuple(args, "KK", &p_memHandle_addr, &new_handle_val)) {
+    return nullptr;
+  }
+  CUmemGenericAllocationHandle* ptr = (CUmemGenericAllocationHandle*)p_memHandle_addr;
+  CUmemGenericAllocationHandle old_val = *ptr;
+  *ptr = (CUmemGenericAllocationHandle)new_handle_val;
+  return PyLong_FromUnsignedLongLong((unsigned long long)old_val);
+}
+
+static PyObject* python_copy_memory(PyObject* self, PyObject* args) {
+  unsigned long long dst;
+  unsigned long long src;
+  unsigned long long size;
+  if (!PyArg_ParseTuple(args, "KKK", &dst, &src, &size)) {
+    return nullptr;
+  }
+  CUDA_CHECK(cuMemcpyAsync((CUdeviceptr)dst, (CUdeviceptr)src, (size_t)size,
+                           (CUstream)0));
+  if (error_code != 0) {
+     PyErr_Format(PyExc_RuntimeError, "cuMemcpyAsync failed: %d", error_code);
+     error_code = no_error;
+     return nullptr;
+  }
+  CUDA_CHECK(cuStreamSynchronize((CUstream)0));
+  if (error_code != 0) {
+     PyErr_Format(PyExc_RuntimeError, "cuStreamSynchronize failed: %d",
+                  error_code);
+     error_code = no_error;
+     return nullptr;
+  }
+  Py_RETURN_NONE;
+}
+
+static PyObject* python_make_tensor_from_ptr(PyObject* self, PyObject* args) {
+  unsigned long long ptr;
+  PyObject* shape_obj;
+  PyObject* dtype_obj;
+  int device_id;
+  
+  if (!PyArg_ParseTuple(args, "KOOi", &ptr, &shape_obj, &dtype_obj, &device_id)) {
+    return nullptr;
+  }
+
+  // Parse shape
+  std::vector<int64_t> shape;
+  if (PyTuple_Check(shape_obj)) {
+      Py_ssize_t len = PyTuple_Size(shape_obj);
+      for (Py_ssize_t i = 0; i < len; i++) {
+          shape.push_back(PyLong_AsLongLong(PyTuple_GetItem(shape_obj, i)));
+      }
+  } else if (PyList_Check(shape_obj)) {
+      Py_ssize_t len = PyList_Size(shape_obj);
+      for (Py_ssize_t i = 0; i < len; i++) {
+          shape.push_back(PyLong_AsLongLong(PyList_GetItem(shape_obj, i)));
+      }
+  } else {
+      PyErr_SetString(PyExc_TypeError, "shape must be tuple or list");
+      return nullptr;
+  }
+
+  // Parse dtype using Torch's python API
+  auto dtype = torch::python::detail::py_object_to_dtype(dtype_obj);
+  auto options = torch::dtype(dtype).device(torch::kCUDA, device_id);
+  
+  // Calculate total size for deleter
+  int64_t numel = 1;
+  for (auto s : shape) numel *= s;
+  int64_t element_size = dtype.itemsize();
+  ssize_t total_bytes = numel * element_size;
+
+  // Create Tensor with custom deleter
+  auto deleter = [ptr, total_bytes, device_id](void* p) {
+      PyGILState_STATE gstate = PyGILState_Ensure();
+      my_free((void*)ptr, total_bytes, device_id, 0);
+      PyGILState_Release(gstate);
+  };
+
+  auto tensor = torch::from_blob((void*)ptr, shape, deleter, options);
+  return pybind11::cast(tensor).release().ptr();
+}
+
+static PyObject* python_sample_hash(PyObject* self, PyObject* args) {
+  unsigned long long ptr;
+  unsigned long long nbytes;
+  if (!PyArg_ParseTuple(args, "KK", &ptr, &nbytes)) {
+    return nullptr;
+  }
+  if (nbytes == 0) {
+    return PyLong_FromUnsignedLongLong(0);
+  }
+  if (nbytes > 4096) {
+    nbytes = 4096;
+  }
+  std::vector<unsigned char> buf((size_t)nbytes);
+  CUDA_CHECK(
+      cuMemcpyDtoH((void*)buf.data(), (CUdeviceptr)ptr, (size_t)nbytes));
+  if (error_code != 0) {
+     PyErr_Format(PyExc_RuntimeError, "cuMemcpyDtoH failed: %d", error_code);
+     error_code = no_error;
+     return nullptr;
+  }
+  unsigned long long hash = 1469598103934665603ULL;
+  for (size_t i = 0; i < (size_t)nbytes; ++i) {
+    hash ^= (unsigned long long)buf[i];
+    hash *= 1099511628211ULL;
+  }
+  return PyLong_FromUnsignedLongLong(hash);
+}
+
 static PyObject* python_create_and_map(PyObject* self, PyObject* args) {
   if (!args || !PyTuple_Check(args) || PyTuple_Size(args) != 4) {
     PyErr_SetString(PyExc_TypeError, "Expected a tuple of size 4");
@@ -706,6 +1093,22 @@ static PyMethodDef module_methods[] = {
      "Create and map memory on the device."},
     {"python_unmap_and_release", (PyCFunction)python_unmap_and_release,
      METH_VARARGS, "Unmap and release memory on the device."},
+    {"reserve_address", (PyCFunction)python_reserve_address, METH_VARARGS, "Reserve virtual address range"},
+    {"create_physical", (PyCFunction)python_create_physical, METH_VARARGS, "Create physical memory handle"},
+    {"create_host_physical", (PyCFunction)python_create_host_physical, METH_VARARGS, "Create host physical memory handle"},
+    {"map_memory", (PyCFunction)python_map_memory, METH_VARARGS, "Map physical memory to virtual address"},
+    {"unmap_memory", (PyCFunction)python_unmap_memory, METH_VARARGS, "Unmap memory from virtual address"},
+    {"set_access", (PyCFunction)python_set_access, METH_VARARGS, "Set memory access flags"},
+    {"release_physical", (PyCFunction)python_release_physical, METH_VARARGS, "Release physical memory handle"},
+    {"free_address", (PyCFunction)python_free_address, METH_VARARGS, "Free virtual address range"},
+    {"get_granularity", (PyCFunction)python_get_granularity, METH_VARARGS, "Get allocation granularity"},
+    {"set_aliasing_param", (PyCFunction)python_set_aliasing_param, METH_VARARGS, "Set aliasing parameters"},
+    {"set_host_mode", (PyCFunction)python_set_host_mode, METH_VARARGS, "Set host mode"},
+    {"set_sparse_limit", (PyCFunction)python_set_sparse_limit, METH_VARARGS, "Set sparse limit"},
+    {"update_handle", (PyCFunction)python_update_handle, METH_VARARGS, "Update handle value"},
+    {"copy_memory", (PyCFunction)python_copy_memory, METH_VARARGS, "Copy memory"},
+    {"make_tensor_from_ptr", (PyCFunction)python_make_tensor_from_ptr, METH_VARARGS, "Create tensor from raw pointer with deleter"},
+    {"sample_hash", (PyCFunction)python_sample_hash, METH_VARARGS, "Sample hash"},
     {NULL, NULL, 0, NULL}  // sentinel
 };
 

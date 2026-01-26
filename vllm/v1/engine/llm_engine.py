@@ -11,6 +11,7 @@ from typing_extensions import TypeVar, deprecated
 
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
+from vllm.device_allocator.vmm_allocator import VMMAllocator
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.distributed.parallel_state import get_dp_group
 from vllm.engine.arg_utils import EngineArgs
@@ -342,6 +343,35 @@ class LLMEngine:
 
         if self.logger_manager is not None:
             self.logger_manager.record_sleep_state(0, 0)
+
+    def activate_model(self):
+        """
+        Activates the model from aliased (host-backed) state to real GPU state.
+        This is used when --enable-aliased-init is set.
+        """
+        if self.model_config.enable_aliased_init:
+             logger.info("Activating model memory from Host Backing...")
+             
+             # Activate locally (if single process)
+             try:
+                 import torch
+                 VMMAllocator.get_instance().disable_aliasing()
+                 VMMAllocator.get_instance().activate_memory(torch.cuda.current_device())
+             except Exception:
+                 pass # Might fail if no CUDA context or VMM not used locally
+             
+             # Activate on workers
+             def _activate_worker(worker):
+                 import torch
+                 from vllm.device_allocator.vmm_allocator import VMMAllocator
+                 VMMAllocator.get_instance().disable_aliasing()
+                 VMMAllocator.get_instance().activate_memory(torch.cuda.current_device())
+                 
+                 # Restore full KV cache allocation now that we are on Device
+                 if hasattr(worker, "restore_full_kv_cache"):
+                     worker.restore_full_kv_cache()
+                 
+             self.collective_rpc(_activate_worker)
 
     def is_sleeping(self) -> bool:
         return self.engine_core.is_sleeping()

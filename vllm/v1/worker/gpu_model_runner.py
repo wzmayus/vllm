@@ -598,6 +598,17 @@ class GPUModelRunner(
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
 
+    def reset_kv_cache(self) -> None:
+        """
+        Resets the KV cache state to allow re-initialization.
+        """
+        self.kv_caches = []
+        self.attn_groups = []
+        self.cross_layers_kv_cache = None
+        self.cross_layers_attn_backend = None
+        if hasattr(self, "kv_cache_config"):
+            del self.kv_cache_config
+
     def reset_mm_cache(self) -> None:
         if self.mm_budget:
             self.mm_budget.reset_cache()

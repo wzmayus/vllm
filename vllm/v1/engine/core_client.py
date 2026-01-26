@@ -147,6 +147,9 @@ class EngineCoreClient(ABC):
     def wake_up(self, tags: list[str] | None = None) -> None:
         raise NotImplementedError
 
+    def activate_model(self) -> None:
+        raise NotImplementedError
+
     def is_sleeping(self) -> bool:
         raise NotImplementedError
 
@@ -217,6 +220,9 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def wake_up_async(self, tags: list[str] | None = None) -> None:
+        raise NotImplementedError
+
+    async def activate_model_async(self) -> None:
         raise NotImplementedError
 
     async def is_sleeping_async(self) -> bool:
@@ -297,6 +303,9 @@ class InprocClient(EngineCoreClient):
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         self.engine_core.wake_up(tags)
+
+    def activate_model(self) -> None:
+        self.engine_core.activate_model()
 
     def is_sleeping(self) -> bool:
         return self.engine_core.is_sleeping()
@@ -774,6 +783,9 @@ class SyncMPClient(MPClient):
     def wake_up(self, tags: list[str] | None = None) -> None:
         self.call_utility("wake_up", tags)
 
+    def activate_model(self) -> None:
+        self.call_utility("activate_model")
+
     def is_sleeping(self) -> bool:
         return self.call_utility("is_sleeping")
 
@@ -969,6 +981,9 @@ class AsyncMPClient(MPClient):
 
     async def wake_up_async(self, tags: list[str] | None = None) -> None:
         await self.call_utility_async("wake_up", tags)
+
+    async def activate_model_async(self) -> None:
+        await self.call_utility_async("activate_model")
 
     async def is_sleeping_async(self) -> bool:
         return await self.call_utility_async("is_sleeping")

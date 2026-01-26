@@ -919,6 +919,12 @@ if envs.VLLM_SERVER_DEV_MODE:
         # is sent but does not finish yet when we return a response.
         return Response(status_code=200)
 
+    @router.post("/activate_model")
+    async def activate_model(raw_request: Request):
+        logger.info("activating model from aliased state")
+        await engine_client(raw_request).activate_model()
+        return Response(status_code=200)
+
     @router.get("/is_sleeping")
     async def is_sleeping(raw_request: Request):
         logger.info("check whether the engine is sleeping")

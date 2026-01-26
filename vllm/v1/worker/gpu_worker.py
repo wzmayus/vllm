@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A GPU worker class."""
 
+import copy
 import gc
 import os
 from contextlib import AbstractContextManager, nullcontext
@@ -152,7 +153,16 @@ class Worker(WorkerBase):
             self.model_runner.init_fp8_kv_scales()
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
-        if self.vllm_config.model_config.enable_sleep_mode:
+        if self.vllm_config.model_config.enable_aliased_init:
+            from vllm.device_allocator.vmm_allocator import VMMAllocator
+
+            allocator = VMMAllocator.get_instance()
+            if tag == "weights":
+                assert allocator.get_current_usage() == 0, (
+                    "Aliased init mode can only be used for one instance per process."
+                )
+            return allocator.use_memory_pool(tag=tag)
+        elif self.vllm_config.model_config.enable_sleep_mode:
             from vllm.device_allocator.cumem import CuMemAllocator
 
             allocator = CuMemAllocator.get_instance()
@@ -235,16 +245,21 @@ class Worker(WorkerBase):
                 * self.cache_config.gpu_memory_utilization
             )
             if self.init_snapshot.free_memory < self.requested_memory:
-                GiB = lambda b: round(b / GiB_bytes, 2)
-                raise ValueError(
-                    f"Free memory on device "
-                    f"({GiB(self.init_snapshot.free_memory)}/"
-                    f"{GiB(self.init_snapshot.total_memory)} GiB) on startup "
-                    f"is less than desired GPU memory utilization "
-                    f"({self.cache_config.gpu_memory_utilization}, "
-                    f"{GiB(self.requested_memory)} GiB). Decrease GPU memory "
-                    f"utilization or reduce GPU memory used by other processes."
-                )
+                # Bypass check if aliased_init is enabled, as we might be squeezing into
+                # a small amount of remaining VRAM while assuming weights are offloaded.
+                if self.vllm_config.model_config.enable_aliased_init:
+                    logger.info("Aliased Init: Bypassing startup memory check.")
+                else:
+                    GiB = lambda b: round(b / GiB_bytes, 2)
+                    raise ValueError(
+                        f"Free memory on device "
+                        f"({GiB(self.init_snapshot.free_memory)}/"
+                        f"{GiB(self.init_snapshot.total_memory)} GiB) on startup "
+                        f"is less than desired GPU memory utilization "
+                        f"({self.cache_config.gpu_memory_utilization}, "
+                        f"{GiB(self.requested_memory)} GiB). Decrease GPU memory "
+                        f"utilization or reduce GPU memory used by other processes."
+                    )
         else:
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
 
@@ -268,9 +283,90 @@ class Worker(WorkerBase):
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self) -> None:
-        eep_scale_up = os.environ.get("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH") == "1"
-        with self._maybe_get_memory_pool_context(tag="weights"):
-            self.model_runner.load_model(eep_scale_up=eep_scale_up)
+        if self.vllm_config.model_config.enable_aliased_init:
+             from vllm.device_allocator.vmm_allocator import VMMAllocator
+             allocator = VMMAllocator.get_instance()
+             allocator.enable_aliasing()
+
+             # Force CPU loading to avoid initial GPU VRAM spike
+             logger.info("Aliased Init: Loading model weights to CPU...")
+             original_device = self.model_runner.device
+             # Hack: temporarily switch device to CPU so ModelRunner loads weights to CPU RAM
+             self.model_runner.device = torch.device("cpu")
+             
+             try:
+                 # Load model (weights go to CPU RAM)
+                 self.model_runner.load_model()
+             finally:
+                 # Restore device
+                 self.model_runner.device = original_device
+             
+             # Move weights to VMM (Host-Backed GPU Virtual Address)
+             self.alias_model_weights(allocator)
+             
+             # Move remaining buffers (non-parameters) to GPU
+             # Note: parameters are already on "cuda" (fake/host-backed), so .to() won't move them.
+             self.model_runner.model.to(original_device)
+             
+             # Disable aliasing for future allocations (e.g. activations)
+             # We want activations to go to real GPU memory (or VMM Device-Backed if we used that)
+             # But VMMAllocator.malloc respects g_use_host_mode. 
+             # Disabling aliasing turns off host mode.
+             allocator.disable_aliasing()
+        else:
+            eep_scale_up = os.environ.get("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH") == "1"
+            with self._maybe_get_memory_pool_context(tag="weights"):
+                self.model_runner.load_model(eep_scale_up=eep_scale_up)
+
+    def alias_model_weights(self, allocator) -> None:
+        """
+        Move model weights from CPU to Host-Backed VMM memory.
+        This allows the model to appear as if it's on GPU (for Graph Capture),
+        but the data resides in Host RAM until activation.
+        """
+        logger.info("Aliased Init: Moving weights from CPU to VMM (Host-Backed)...")
+        total_bytes = 0
+        model = self.model_runner.model
+        
+        # We need to iterate over all modules to replace parameters in-place
+        for name, module in model.named_modules():
+            # Use named_parameters(recurse=False) to handle each module's direct parameters
+            for param_name, param in module.named_parameters(recurse=False):
+                if param is None: continue
+                
+                # We expect params to be on CPU here
+                if param.device.type != "cpu":
+                    logger.warning(f"Parameter {name}.{param_name} is on {param.device}, expected cpu.")
+                
+                # Allocate VMM tensor (Host-Backed)
+                # The returned tensor is a CUDA tensor wrapping the VMM pointer
+                size = param.nbytes
+                try:
+                    vmm_tensor = allocator.allocate_tensor(size, param.shape, param.dtype, self.device)
+                except Exception as e:
+                    logger.error(f"Failed to allocate VMM tensor for {name}.{param_name}: {e}")
+                    raise e
+                
+                # Copy data from CPU param to VMM tensor
+                # Since vmm_tensor is physically on Host (pinned), this copy is fast
+                vmm_tensor.copy_(param)
+                
+                # Wrap in nn.Parameter if necessary
+                if isinstance(param, torch.nn.Parameter):
+                    new_param = torch.nn.Parameter(vmm_tensor, requires_grad=param.requires_grad)
+                else:
+                    new_param = vmm_tensor
+                    
+                # Replace the parameter in the module
+                setattr(module, param_name, new_param)
+                total_bytes += size
+                
+        logger.info(f"Aliased Init: Moved {total_bytes / 1024**3:.2f} GiB of weights to VMM.")
+        
+        # Force GC to free the original CPU memory
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
@@ -325,6 +421,28 @@ class Worker(WorkerBase):
 
         self.non_torch_memory = profile_result.non_torch_increase
         self.peak_activation_memory = profile_result.torch_peak_increase
+
+        # Fix logging for Aliased Init: The profiler sees Torch allocation increase (weights)
+        # but no driver memory decrease (because they are on CPU). This results in negative
+        # non_torch_memory. We correct this for reporting.
+        if self.vllm_config.model_config.enable_aliased_init:
+            model_weights_size = int(self.model_runner.model_memory_usage)
+            # Add weights back to neutralize the negative value in non_torch_memory
+            self.non_torch_memory += model_weights_size
+            
+            # CRITICAL FIX: We must also add weights to non_kv_cache_memory.
+            # profile_result.non_kv_cache_memory = non_torch (negative) + peak + weights
+            # Since non_torch is artificially low (by ~weights), the result is ~peak.
+            # We need it to be ~peak + weights so that available_kv_cache = Total - (Peak + Weights).
+            profile_result.non_kv_cache_memory += model_weights_size
+            
+            logger.info(
+                f"Aliased Init: Corrected non-torch memory to {GiB(self.non_torch_memory):.2f} GiB "
+                f"and reserved {GiB(model_weights_size):.2f} GiB in non_kv_cache_memory "
+                "(compensating for CPU-offloaded weights)."
+            )
+
+        free_gpu_memory = profile_result.after_profile.free_memory
 
         free_gpu_memory = profile_result.after_profile.free_memory
         # NOTE(woosuk): Here we assume that the other processes using the same
@@ -386,6 +504,43 @@ class Worker(WorkerBase):
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
 
+        if self.vllm_config.model_config.enable_aliased_init:
+            from vllm.device_allocator.vmm_allocator import VMMAllocator
+            
+            # Create a minimal config for startup tasks (Profiling/Warmup)
+            # We need just enough blocks to support the dummy run (max_num_batched_tokens)
+            # BUT we must allocate the FULL tensors (virtual address space) so that
+            # CUDA Graphs capture the correct pointers.
+            # We use VMMAllocator's sparse_limit to only back the necessary part with memory.
+            
+            block_size = self.cache_config.block_size
+            max_tokens = self.scheduler_config.max_num_batched_tokens
+            # Calculate minimum blocks: ceil(max_tokens / block_size) + buffer
+            min_blocks = (max_tokens + block_size - 1) // block_size + 32
+            
+            # Calculate min_bytes needed for the tensors
+            # We assume tensors are proportional to num_blocks
+            original_num_blocks = kv_cache_config.num_blocks
+            max_min_bytes = 0
+            
+            if original_num_blocks > 0:
+                for tensor in kv_cache_config.kv_cache_tensors:
+                    per_block_size = tensor.size / original_num_blocks
+                    min_bytes_for_tensor = int(per_block_size * min_blocks)
+                    if min_bytes_for_tensor > max_min_bytes:
+                        max_min_bytes = min_bytes_for_tensor
+            
+            # Align to 2MB (huge page) just in case
+            max_min_bytes = (max_min_bytes + 2 * 1024 * 1024 - 1) // (2 * 1024 * 1024) * (2 * 1024 * 1024)
+
+            logger.info(
+                "Aliased Init: Initializing with sparse KV cache (limit %d bytes per tensor) "
+                "to save memory for startup tasks while reserving full VA space.",
+                max_min_bytes
+            )
+            
+            VMMAllocator.get_instance().set_sparse_allocation_limit(max_min_bytes)
+
         # Init kv cache connector here, because it requires
         # `kv_cache_config`.
         # NOTE(Kuntai): This need to be done before `initialize_kv_cache`,
@@ -399,8 +554,28 @@ class Worker(WorkerBase):
             allocator = CuMemAllocator.get_instance()
             with allocator.use_memory_pool(tag="kv_cache"):
                 self.model_runner.initialize_kv_cache(kv_cache_config)
+        elif self.vllm_config.model_config.enable_aliased_init:
+            from vllm.device_allocator.vmm_allocator import VMMAllocator
+            # Wrap KV cache initialization to force sparse allocation
+            with VMMAllocator.get_instance().use_memory_pool("kv_cache"):
+                self.model_runner.initialize_kv_cache(kv_cache_config)
         else:
             self.model_runner.initialize_kv_cache(kv_cache_config)
+            
+        if self.vllm_config.model_config.enable_aliased_init:
+             from vllm.device_allocator.vmm_allocator import VMMAllocator
+             # Reset limit so subsequent allocations (if any) are full
+             VMMAllocator.get_instance().set_sparse_allocation_limit(0)
+
+    def restore_full_kv_cache(self) -> None:
+        """
+        Restores the full KV cache allocation when Aliased Init model is activated.
+        """
+        # In the new design using Sparse VMM for KV cache, we don't need to
+        # re-allocate tensors. The tensors already have the full Virtual Address space.
+        # The activation process (activate_memory) automatically fills in the 
+        # missing physical memory pages.
+        logger.info("Aliased Init: KV cache activation handled by VMM remapping.")
 
     def compile_or_warm_up_model(self) -> None:
         # warm up sizes that are not in cudagraph capture sizes,
@@ -442,6 +617,12 @@ class Worker(WorkerBase):
             # slightly underestimate the memory consumption.
             # So leave a small buffer (=150MiB) to avoid OOM.
             redundancy_buffer_memory = 150 * (1 << 20)
+            if self.vllm_config.model_config.enable_aliased_init:
+                # Increase buffer to 4GB to prevent OOM during massive memory restoration.
+                # Empirical evidence showed 3.7GB overflow with 150MB buffer.
+                # This subtracts from the AVAILABLE limit, reducing the max KV cache size.
+                redundancy_buffer_memory = 4096 * (1 << 20)
+
             non_kv_cache_memory = (
                 self.model_runner.model_memory_usage
                 + self.peak_activation_memory
@@ -458,6 +639,21 @@ class Worker(WorkerBase):
                 - non_kv_cache_memory
                 - redundancy_buffer_memory
             )
+
+            current_usage_msg = "Calculated available KV cache memory is"
+            if self.vllm_config.model_config.enable_aliased_init:
+                current_usage_msg = "Calculated potential (deferred) KV cache memory is"
+                # Detailed logging for Aliased Init verification
+                logger.info(
+                    f"Aliased Init Memory Debug: Total Requested: {GiB(self.requested_memory):.2f} GiB, "
+                    f"Weights: {GiB(self.model_runner.model_memory_usage):.2f} GiB, "
+                    f"Peak Activation: {GiB(self.peak_activation_memory):.2f} GiB, "
+                    f"Non-Torch: {GiB(self.non_torch_memory):.2f} GiB, "
+                    f"Graph: {GiB(cuda_graph_memory_bytes):.2f} GiB, "
+                    f"Buffer: {GiB(redundancy_buffer_memory):.2f} GiB. "
+                    f"Formula: Requested - (Weights + Peak + Non-Torch + Graph + Buffer) = "
+                    f"{GiB(kv_cache_memory_bytes_to_requested_limit):.2f} GiB"
+                )
 
             msg = (
                 f"Free memory on device "
@@ -477,7 +673,7 @@ class Worker(WorkerBase):
                 f"into requested memory, or `--kv-cache-memory="
                 f"{kv_cache_memory_bytes_to_gpu_limit}` "
                 f"({GiB(kv_cache_memory_bytes_to_gpu_limit)} GiB) to fully "
-                f"utilize gpu memory. Current kv cache memory in use is "
+                f"utilize gpu memory. {current_usage_msg} "
                 f"{GiB(self.available_kv_cache_memory_bytes)} GiB."
             )
 
